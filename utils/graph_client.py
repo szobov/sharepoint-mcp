@@ -2,7 +2,9 @@
 
 import requests
 import logging
-from typing import Dict, Any, List, Union, BinaryIO
+import json
+import base64
+from typing import Dict, Any, Optional, List, Union, BinaryIO
 
 from auth.sharepoint_auth import SharePointContext
 
@@ -1230,74 +1232,53 @@ class GraphClient:
             ["General", "Templates", "Working Documents", "Published", "Archive"],
         )
 
-    async def list_folder_contents(
-        self, site_id: str, drive_id: str, folder_path: str = ""
-    ) -> Dict[str, Any]:
-        """List files and folders at a given path in a document library.
+    async def get_item_by_path(self, drive_id: str, item_path: str) -> Dict[str, Any]:
+        """Get a drive item by its path.
 
         Args:
-            site_id: ID of the site
-            drive_id: ID of the document library (drive)
-            folder_path: Folder path relative to drive root (e.g. "General" or
-                "Docs/2026"). Use empty string or "/" to list the root.
+            drive_id: ID of the drive (document library)
+            item_path: Path to the item within the drive (e.g., "folder/subfolder/file.docx")
 
         Returns:
-            Graph API response containing a 'value' list of drive items
+            Drive item information including id, name, webUrl, etc.
         """
-        if not folder_path or folder_path.strip("/") == "":
-            endpoint = f"sites/{site_id}/drives/{drive_id}/root/children"
-        else:
-            clean_path = folder_path.strip("/")
-            endpoint = f"sites/{site_id}/drives/{drive_id}/root:/{clean_path}:/children"
-
-        logger.info(f"Listing folder contents at path: '{folder_path or '/'}'")
+        # URL encode the path but keep forward slashes
+        endpoint = f"drives/{drive_id}/root:/{item_path}"
+        logger.info(f"Getting item by path: {item_path}")
         return await self.get(endpoint)
 
-    async def get_document_content_by_path(
-        self, site_id: str, drive_id: str, file_path: str
-    ) -> bytes:
-        """Get content of a document by its path in a document library.
+    async def get_item_comments(self, drive_id: str, item_id: str) -> Dict[str, Any]:
+        """Get comments on a drive item (document).
+
+        Note: Comments API is available for OneDrive for Business.
+        For SharePoint document libraries, comments may be stored differently.
 
         Args:
-            site_id: ID of the site
-            drive_id: ID of the document library (drive)
-            file_path: File path relative to drive root (e.g. "General/report.docx")
+            drive_id: ID of the drive (document library)
+            item_id: ID of the item
 
         Returns:
-            Document content as bytes
+            List of comments on the item
         """
-        clean_path = file_path.strip("/")
-        url = f"{self.base_url}/sites/{site_id}/drives/{drive_id}/root:/{clean_path}:/content"
+        endpoint = f"drives/{drive_id}/items/{item_id}/comments"
+        logger.info(f"Getting comments for item: {item_id}")
+        return await self.get(endpoint)
 
-        headers = self.context.headers.copy()
-        headers.pop("Content-Type", None)
-
-        logger.info(f"Getting document content by path: '{file_path}'")
-        response = requests.get(url, headers=headers, stream=True)
-
-        if response.status_code != 200:
-            error_text = response.text
-            logger.error(f"Graph API error: {response.status_code} - {error_text}")
-            raise Exception(f"Graph API error: {response.status_code} - {error_text}")
-
-        return response.content
-
-    async def get_item_metadata_by_path(
-        self, site_id: str, drive_id: str, item_path: str
+    async def get_list_item_comments(
+        self, site_id: str, list_id: str, item_id: str
     ) -> Dict[str, Any]:
-        """Get metadata of a file or folder by its path in a document library.
+        """Get comments on a list item.
+
+        SharePoint stores comments as part of list items via the comments endpoint.
 
         Args:
             site_id: ID of the site
-            drive_id: ID of the document library (drive)
-            item_path: Item path relative to drive root (e.g. "General/report.docx"
-                or "General")
+            list_id: ID of the list
+            item_id: ID of the list item
 
         Returns:
-            Drive item metadata including id, name, size, webUrl, and timestamps
+            List of comments on the item
         """
-        clean_path = item_path.strip("/")
-        endpoint = f"sites/{site_id}/drives/{drive_id}/root:/{clean_path}"
-
-        logger.info(f"Getting item metadata by path: '{item_path}'")
+        endpoint = f"sites/{site_id}/lists/{list_id}/items/{item_id}/comments"
+        logger.info(f"Getting comments for list item: {item_id}")
         return await self.get(endpoint)

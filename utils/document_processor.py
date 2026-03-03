@@ -2,14 +2,14 @@
 
 import io
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 # Packages to support different file formats
 try:
     import pandas as pd
     import docx
     from PyPDF2 import PdfReader
-    import openpyxl  # noqa: F401
+    import openpyxl
 
     HAS_DOCUMENT_LIBRARIES = True
 except ImportError:
@@ -180,6 +180,9 @@ class DocumentProcessor:
 
                 structure.append({"level": level, "text": p.text})
 
+        # Extract Word comments from the docx file
+        comments = DocumentProcessor._extract_word_comments(content)
+
         return {
             "type": "word",
             "paragraph_count": len(paragraphs),
@@ -188,7 +191,87 @@ class DocumentProcessor:
             "tables": tables[:5],  # First 5 tables only
             "properties": core_properties,
             "structure": structure,
+            "comments": comments,
         }
+
+    @staticmethod
+    def _extract_word_comments(content: bytes) -> list:
+        """Extract comments from a Word document.
+
+        Word documents store comments in word/comments.xml within the .docx zip archive.
+
+        Args:
+            content: Word document content as bytes
+
+        Returns:
+            List of comments with author, date, and text
+        """
+        import zipfile
+        from xml.etree import ElementTree as ET
+
+        comments = []
+
+        try:
+            # Open the docx as a zip file
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                # Check if comments.xml exists
+                if "word/comments.xml" not in zf.namelist():
+                    logger.debug("No comments.xml found in document")
+                    return []
+
+                # Parse comments.xml
+                with zf.open("word/comments.xml") as comments_file:
+                    tree = ET.parse(comments_file)
+                    root = tree.getroot()
+
+                    # Define namespace - Word uses the 'w' namespace
+                    ns = {
+                        "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                    }
+
+                    # Find all comment elements
+                    for comment_elem in root.findall(".//w:comment", ns):
+                        comment_id = comment_elem.get(
+                            "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}id"
+                        )
+                        author = comment_elem.get(
+                            "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}author",
+                            "Unknown",
+                        )
+                        date = comment_elem.get(
+                            "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}date",
+                            "",
+                        )
+                        initials = comment_elem.get(
+                            "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}initials",
+                            "",
+                        )
+
+                        # Extract comment text from all <w:t> elements within the comment
+                        text_parts = []
+                        for t_elem in comment_elem.findall(".//w:t", ns):
+                            if t_elem.text:
+                                text_parts.append(t_elem.text)
+
+                        comment_text = "".join(text_parts)
+
+                        if comment_text.strip():
+                            comments.append(
+                                {
+                                    "id": comment_id,
+                                    "author": author,
+                                    "initials": initials,
+                                    "date": date,
+                                    "text": comment_text,
+                                }
+                            )
+
+                    logger.info(f"Extracted {len(comments)} comments from document")
+
+        except Exception as e:
+            logger.error(f"Error extracting Word comments: {str(e)}")
+
+        return comments
 
     @staticmethod
     def _process_pdf(content: bytes) -> Dict[str, Any]:
@@ -269,7 +352,7 @@ class DocumentProcessor:
             "character_count": char_count,
             "average_line_length": round(avg_line_length, 2),
             "content": lines[:30],  # First 30 lines only
-            "format": (
-                "html" if is_html else ("markdown" if is_markdown else "plain_text")
-            ),
+            "format": "html"
+            if is_html
+            else ("markdown" if is_markdown else "plain_text"),
         }
