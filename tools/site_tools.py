@@ -2,7 +2,7 @@
 
 import json
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 
 from mcp.server.fastmcp import FastMCP, Context
 
@@ -18,9 +18,34 @@ logger = logging.getLogger("sharepoint_tools")
 
 def _check_auth(sp_ctx) -> None:
     """Check if authentication context is valid, raise exception if not."""
-    if not sp_ctx or sp_ctx.access_token == "error" or not sp_ctx.is_token_valid():
+    logger.debug(f"_check_auth called with sp_ctx type: {type(sp_ctx)}")
+    logger.debug(f"_check_auth sp_ctx is None: {sp_ctx is None}")
+
+    if not sp_ctx:
+        logger.error("sp_ctx is None or falsy")
         raise Exception(
-            "SharePoint authentication failed. Please check your configuration (CLIENT_ID, CLIENT_SECRET, TENANT_ID, SITE_URL)."
+            "SharePoint authentication failed: lifespan_context is None. Please check your configuration (CLIENT_ID, CLIENT_SECRET, TENANT_ID, SITE_URL)."
+        )
+
+    logger.debug(
+        f"_check_auth sp_ctx.access_token: {sp_ctx.access_token[:20] if sp_ctx.access_token else 'None'}..."
+    )
+
+    if sp_ctx.access_token == "error":
+        logger.error(
+            "sp_ctx.access_token is 'error' - authentication failed during startup"
+        )
+        raise Exception(
+            "SharePoint authentication failed during startup. Please check your configuration (CLIENT_ID, CLIENT_SECRET, TENANT_ID, SITE_URL)."
+        )
+
+    logger.debug(f"_check_auth sp_ctx.token_expiry: {sp_ctx.token_expiry}")
+    logger.debug(f"_check_auth sp_ctx.is_token_valid(): {sp_ctx.is_token_valid()}")
+
+    if not sp_ctx.is_token_valid():
+        logger.error(f"Token expired. Expiry: {sp_ctx.token_expiry}")
+        raise Exception(
+            "SharePoint authentication failed: token expired. Please check your configuration (CLIENT_ID, CLIENT_SECRET, TENANT_ID, SITE_URL)."
         )
 
 
@@ -161,13 +186,16 @@ def register_site_tools(mcp: FastMCP):
                 logger.error("Failed to get site ID")
                 raise Exception("Error: Could not retrieve site ID")
 
-            # Execute search request
-            search_url = f"sites/{site_id}/search"
+            # Execute search request using the correct Microsoft Graph Search API endpoint
+            # See: https://learn.microsoft.com/en-us/graph/api/search-query
+            # Region is required for application permissions (client credentials flow)
+            search_url = "search/query"
             search_data = {
                 "requests": [
                     {
-                        "entityTypes": ["driveItem", "listItem", "list"],
+                        "entityTypes": ["driveItem", "listItem", "list", "site"],
                         "query": {"queryString": query},
+                        "region": "EMEA",
                     }
                 ]
             }
@@ -175,18 +203,21 @@ def register_site_tools(mcp: FastMCP):
             logger.debug(f"Search request: {search_data}")
             search_results = await graph_client.post(search_url, search_data)
 
-            # Format search results
+            # Format search results - include IDs needed for further operations
             formatted_results = []
             for result in search_results.get("value", [])[0].get("hitsContainers", []):
                 for hit in result.get("hits", []):
+                    resource = hit.get("resource", {})
+                    parent_ref = resource.get("parentReference", {})
                     formatted_results.append(
                         {
-                            "title": hit.get("resource", {}).get("name", "Unknown"),
-                            "url": hit.get("resource", {}).get("webUrl", "Unknown"),
-                            "type": hit.get("resource", {}).get(
-                                "@odata.type", "Unknown"
-                            ),
+                            "title": resource.get("name", "Unknown"),
+                            "url": resource.get("webUrl", "Unknown"),
+                            "type": resource.get("@odata.type", "Unknown"),
                             "summary": hit.get("summary", "No summary available"),
+                            "item_id": resource.get("id", "Unknown"),
+                            "drive_id": parent_ref.get("driveId", "Unknown"),
+                            "site_id": parent_ref.get("siteId", "Unknown"),
                         }
                     )
 
@@ -564,129 +595,106 @@ def register_site_tools(mcp: FastMCP):
             raise  # Re-raise exception so FastMCP can mark it as an error
 
     @mcp.tool()
-    async def list_folder_contents(
-        ctx: Context, site_id: str, drive_id: str, folder_path: str = ""
-    ) -> str:
-        """List files and folders at a given path in a SharePoint document library.
+    async def get_document_comments(ctx: Context, drive_id: str, item_id: str) -> str:
+        """Get comments on a SharePoint document.
 
         Args:
-            site_id: ID of the site
-            drive_id: ID of the document library (drive)
-            folder_path: Folder path relative to drive root (e.g. "General" or
-                "Docs/2026"). Leave empty to list the root of the drive.
+            drive_id: ID of the document library (from search results)
+            item_id: ID of the document (from search results)
         """
-        logger.info(f"Tool called: list_folder_contents path='{folder_path or '/'}'")
+        logger.info(f"Tool called: get_document_comments for item: {item_id}")
+
         try:
+            # Get authentication context and refresh if needed
             sp_ctx = ctx.request_context.lifespan_context
             _check_auth(sp_ctx)
             await refresh_token_if_needed(sp_ctx)
+
+            # Create Graph client
             graph_client = GraphClient(sp_ctx)
 
-            result = await graph_client.list_folder_contents(
-                site_id, drive_id, folder_path
-            )
+            # Get document comments
+            comments_data = await graph_client.get_item_comments(drive_id, item_id)
 
-            items = result.get("value", [])
-            formatted = [
-                {
-                    "name": item.get("name", "Unknown"),
-                    "type": "folder" if "folder" in item else "file",
-                    "size": item.get("size", 0),
-                    "id": item.get("id", "Unknown"),
-                    "web_url": item.get("webUrl", "Unknown"),
-                    "last_modified": item.get("lastModifiedDateTime", "Unknown"),
-                }
-                for item in items
-            ]
+            # Format comments
+            comments = comments_data.get("value", [])
+            formatted_comments = []
+            for comment in comments:
+                formatted_comments.append(
+                    {
+                        "id": comment.get("id", "Unknown"),
+                        "content": comment.get("content", ""),
+                        "createdBy": comment.get("createdBy", {})
+                        .get("user", {})
+                        .get("displayName", "Unknown"),
+                        "createdDateTime": comment.get("createdDateTime", "Unknown"),
+                        "replies": [
+                            {
+                                "id": reply.get("id", "Unknown"),
+                                "content": reply.get("content", ""),
+                                "createdBy": reply.get("createdBy", {})
+                                .get("user", {})
+                                .get("displayName", "Unknown"),
+                                "createdDateTime": reply.get(
+                                    "createdDateTime", "Unknown"
+                                ),
+                            }
+                            for reply in comment.get("replies", [])
+                        ],
+                    }
+                )
 
-            logger.info(
-                f"Successfully listed {len(formatted)} items at path '{folder_path or '/'}'"
-            )
-            return json.dumps(formatted, indent=2)
+            logger.info(f"Successfully retrieved {len(formatted_comments)} comments")
+            return json.dumps(formatted_comments, indent=2)
         except Exception as e:
-            logger.error(f"Error in list_folder_contents: {str(e)}")
-            raise
+            logger.error(f"Error in get_document_comments: {str(e)}")
+            raise  # Re-raise exception so FastMCP can mark it as an error
 
     @mcp.tool()
-    async def get_document_by_path(
-        ctx: Context, site_id: str, drive_id: str, file_path: str, filename: str
-    ) -> str:
-        """Get and process the content of a SharePoint document by its path.
+    async def get_document_by_path(ctx: Context, drive_id: str, file_path: str) -> str:
+        """Get document information by its path in the document library.
+
+        This is useful when you know the file path but not the item ID.
 
         Args:
-            site_id: ID of the site
-            drive_id: ID of the document library (drive)
-            file_path: File path relative to drive root (e.g. "General/report.docx")
-            filename: File name used to detect the document type (e.g. "report.docx")
+            drive_id: ID of the document library
+            file_path: Path to the file within the library (e.g., "folder/subfolder/file.docx")
         """
-        logger.info(f"Tool called: get_document_by_path path='{file_path}'")
+        logger.info(f"Tool called: get_document_by_path for path: {file_path}")
+
         try:
+            # Get authentication context and refresh if needed
             sp_ctx = ctx.request_context.lifespan_context
             _check_auth(sp_ctx)
             await refresh_token_if_needed(sp_ctx)
+
+            # Create Graph client
             graph_client = GraphClient(sp_ctx)
 
-            content = await graph_client.get_document_content_by_path(
-                site_id, drive_id, file_path
-            )
+            # Get item by path
+            item_info = await graph_client.get_item_by_path(drive_id, file_path)
 
-            processed_content = DocumentProcessor.process_document(content, filename)
-
-            logger.info(
-                f"Successfully processed document content for path: '{file_path}'"
-            )
-            return json.dumps(processed_content, indent=2)
-        except Exception as e:
-            logger.error(f"Error in get_document_by_path: {str(e)}")
-            raise
-
-    @mcp.tool()
-    async def get_item_metadata(
-        ctx: Context, site_id: str, drive_id: str, item_path: str
-    ) -> str:
-        """Get metadata of a file or folder by its path in a SharePoint document library.
-
-        Returns the item's id, name, size, web URL, and timestamps.
-        Use the returned id with get_document_content to retrieve file content.
-
-        Args:
-            site_id: ID of the site
-            drive_id: ID of the document library (drive)
-            item_path: Item path relative to drive root (e.g. "General/report.docx"
-                or "General")
-        """
-        logger.info(f"Tool called: get_item_metadata path='{item_path}'")
-        try:
-            sp_ctx = ctx.request_context.lifespan_context
-            _check_auth(sp_ctx)
-            await refresh_token_if_needed(sp_ctx)
-            graph_client = GraphClient(sp_ctx)
-
-            item = await graph_client.get_item_metadata_by_path(
-                site_id, drive_id, item_path
-            )
-
+            # Format result
             result = {
-                "id": item.get("id", "Unknown"),
-                "name": item.get("name", "Unknown"),
-                "size": item.get("size", 0),
-                "web_url": item.get("webUrl", "Unknown"),
-                "created_by": item.get("createdBy", {})
+                "id": item_info.get("id", "Unknown"),
+                "name": item_info.get("name", "Unknown"),
+                "webUrl": item_info.get("webUrl", "Unknown"),
+                "size": item_info.get("size", 0),
+                "createdDateTime": item_info.get("createdDateTime", "Unknown"),
+                "lastModifiedDateTime": item_info.get(
+                    "lastModifiedDateTime", "Unknown"
+                ),
+                "createdBy": item_info.get("createdBy", {})
                 .get("user", {})
                 .get("displayName", "Unknown"),
-                "created_datetime": item.get("createdDateTime", "Unknown"),
-                "last_modified_datetime": item.get("lastModifiedDateTime", "Unknown"),
+                "lastModifiedBy": item_info.get("lastModifiedBy", {})
+                .get("user", {})
+                .get("displayName", "Unknown"),
+                "drive_id": drive_id,
             }
 
-            if "folder" in item:
-                result["type"] = "folder"
-                result["child_count"] = item["folder"].get("childCount", 0)
-            elif "file" in item:
-                result["type"] = "file"
-                result["mime_type"] = item["file"].get("mimeType", "Unknown")
-
-            logger.info(f"Successfully retrieved metadata for path: '{item_path}'")
+            logger.info(f"Successfully retrieved document info for: {file_path}")
             return json.dumps(result, indent=2)
         except Exception as e:
-            logger.error(f"Error in get_item_metadata: {str(e)}")
-            raise
+            logger.error(f"Error in get_document_by_path: {str(e)}")
+            raise  # Re-raise exception so FastMCP can mark it as an error
